@@ -1,0 +1,215 @@
+#!/bin/sh
+## nrx version 0.1.5
+##
+## Copyright 2013 <gregor@fiatflux.co.uk>.
+## Released under GPL 3 with the following amendments:
+##   - Don't be an imperialist asshole.
+##
+## PURPOSE
+##   Streamline the use of nested PGP keys, for the purpose of combining the
+##   security of a smartcard with the security of a longer or otherwise
+##   smartcard-incompatible key. To this end, nrx 0.1 chains smartcard
+##   encryption with local encryption, around a standardized inner format.
+##
+## INNER FORMAT
+##   ./message_name/
+##       MESSAGE                      # Created automatically; required.
+##       attachment_1                 # Attached files may be specified by user.
+##       attachment_2/                # Attached directories work too.
+##           some-file.exe
+##           some-other-file.bat
+##
+## SETUP
+##   ) Add groups <recipient> and <recipient>_hw in ~/.gnupg/gpg.conf
+##   ) Add HWKEY to env. This is the PGP key ID for the inner layer of _your_ key.
+##
+## USAGE
+##   Create (encrypt):
+##     $ nrx -r [recipient] [messagename]
+##   Deflate (decrypt):
+##     $ nrx -d [name_of_file.nrx]
+##     Message name can be a directory in present scope, in which case its
+##     contents will be included with the message.
+##
+## TODO: 
+##   -Better arg processing.
+##   -Add random padding or inner OTP (like Schneier recommends) or something.
+##   -Add outer wrapper for use with boggus.
+##   -Allow invocation like:
+##      nrx -r [recipient] [messagename] [attachment1] [attachment2] ...
+
+
+voldir="/dev/shm"
+tmpdir="${voldir}/nrx${PWD}"
+
+usage() {
+    echo "Usage:"
+    echo "  encrypt: nrx -r [recipient] [messagename]"
+    echo "  decrypt: nrx -d [name_of_file.nrx]"
+    echo "  nuke tempfiles: nrx --nuke [directory]"
+    echo "  nuke all tempfiles: nrx --nukeall"
+}
+
+encode() {
+  recipient_group=${1}
+  msgname="${2}"
+
+  # Recipient group name for hardware keys.
+  recipient__hw_group=${recipient_group}_hw
+  # Relative to ${tmpdir}.
+  msgfile="MESSAGE"
+
+  umask 077
+
+    # Make a temporary directory in which to do our work.
+  mkdir -p "${tmpdir}/${msgname}"
+
+  # If message directory already exists in ${PWD}, copy it to our ramdisk working dir.
+  if [ -d "./${msgname}" ]; then
+    cp -r "${msgname}" "${tmpdir}"
+  elif [[ -f "./${msgname}" ]]; then
+    cp "./${msgname}" "${tmpdir}/${msgname}/MESSAGE"
+  else
+    # Open or edit payload MESSAGE.
+    if [[ ${EDITOR} == "vim" ]]; then
+      editor_opts="-n"
+    else
+      echo
+      echo "WARNING: cannot determine safety of your default editor, ${EDITOR}."
+      echo "Only vim supported for now."
+      echo "Do you want to continue? y/N"
+
+      read ans
+      if [[ ${ans} != "y" ]] && [[ ${ans} != "Y" ]]; then
+        echo "Exiting."
+        exit 1
+      fi
+    fi
+
+    ${EDITOR} ${editor_opts} "${tmpdir}/${msgname}/${msgfile}"
+  fi
+
+  # Any more files/dirs needed?
+  echo "Enter relative or absolute path to any attachments you wish to include."
+  echo "Leave blank when done."
+  read attachment
+  while [[ -n "${attachment}" ]]; do
+    if [[ -e "${attachment}" ]]; then
+      cp -r "${attachment}" "${tmpdir}/${msgname}"
+    else
+      echo "Not a file nor directory."
+      echo "Enter relative or absolute path to any attachments you wish to include."
+      echo "Leave blank when done."
+    fi
+    read attachment
+  done;
+
+  # Make tarball.
+  tarball="${msgname}.tgz"
+  (
+    cd "${tmpdir}"
+    tar -czf "${tarball}" "${msgname}"
+  )
+
+  # TODO: use padding or encrypted OTP or something to prevent known-portion
+  # attacks on the structure of tgz or inner asc, etc.
+  # To start with, can just use Russian copulation.
+
+  # List contents of archive.
+  contents=$(tar -tf "${tmpdir}/${tarball}")
+
+  if [[ $(echo contents | wc -l) -le 0 ]]; then
+    echo "Error: no files to encrypt."
+    exit 1;
+  fi
+
+  echo "Done making tarball at ${tmpdir}/${tarball} containing:"
+  echo -e "${contents}"
+
+  # Encrypt with inner key.
+  gpg  --armor --sign --encrypt --local-user "${HWKEY}" \
+      --recipient "${recipient__hw_group}" \
+      -o "${tmpdir}/${tarball}.asc" "${tmpdir}/${tarball}" || exit 2
+  # Encrypt with the outer key.
+  gpg  --armor --sign --encrypt \
+      --recipient "${recipient_group}" \
+      -o "${tmpdir}/${msgname}.nrx" "${tmpdir}/${tarball}.asc" || exit 2
+
+  cp "${tmpdir}/${msgname}.nrx" .
+
+  # WARNING: this WILL NOT shred ${EDITOR}'s swapfiles, etc.
+  shred -uz "${tmpdir}/${tarball}"
+  shred -uz "${tmpdir}/${tarball}.asc"
+  shred -uz $(find "${tmpdir}/${msgname}" -type f)
+  rm -rf "${tmpdir}/${msgname}"
+}
+
+decode() {
+  filename=${1}
+  umask 077
+  if [[ -r ${filename} ]]; then
+    msgname=$(basename -s ".nrx" "${filename}")
+
+    mkdir -p "${tmpdir}"
+
+    gpg -o "${tmpdir}/${msgname}.tgz.asc" \
+      --decrypt "${filename}" || exit 2
+    gpg -o "${tmpdir}/${msgname}.tgz" \
+      --decrypt "${tmpdir}/${msgname}.tgz.asc" || exit 2
+
+    tar -C "${tmpdir}" -xzf "${tmpdir}/${msgname}.tgz" 
+    echo
+    echo "Included files:"
+    (
+      cd "${tmpdir}/${msgname}"
+      find
+    )
+    echo
+    echo "Message deflated to ${tmpdir}/${msgname}."
+    echo
+    cat "${tmpdir}/${msgname}/MESSAGE"
+
+    shred -uz "${tmpdir}/${msgname}.tgz"
+    shred -uz "${tmpdir}/${msgname}.tgz.asc"
+
+    # In 10 minutes, destroy plaintext files in ${voldir}/nrx.
+    # THIS SHOULD BE DIR SPECIFIC.
+    echo "${0} --nuke ${tmpdir}" | at now + 10min
+
+  else
+    echo "Cannot stat file ${filename}."
+    return 1
+  fi
+}
+
+nukeall() {
+  shred -uz $(find "${voldir}/nrx" -type f)
+  rm -rf "${voldir}/nrx"
+}
+
+nuke() {
+  dir=${1}  
+  if [[ -d ${dir} ]]; then
+    shred -uz $(find "${dir}" -type f)
+    rm -rf "${dir}"
+  elif [[-d "${tmpdir}/${dir}"]]; then
+    shred -uz $(find "${tmpdir}/${dir}" -type f)
+    rm -rf "${tmpdir}/${dir}"
+  else
+    echo "Cannot stat directory ${dir} nor ${tmpdir}/${dir}"
+    return 1
+  fi
+}
+
+if [[ ".${1}" == ".-d" ]]; then
+  decode ${2}
+elif [ ".${1}" == ".-r" ]; then
+  encode "${2}" "${3}"
+elif [[ ".${1}" == ".--nuke" ]]; then
+  nuke "${2}"
+elif [[ ".${1}" == ".--nukeall" ]]; then
+  nukeall
+else
+  usage
+  exit 1
+fi
